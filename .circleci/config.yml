@@ -1,0 +1,168 @@
+version: 2.1
+orbs:
+  aws-ecr: circleci/aws-ecr@8.1.3
+  gh-cli: circleci/github-cli@2.1.1
+
+# TODO: Setup the linter and tests
+
+jobs:
+  docker_build_and_push_app_image:
+    machine:
+      image: ubuntu-2204:current
+      docker_layer_caching: true
+    resource_class: medium
+    steps:
+      - checkout
+      - aws-ecr/ecr-login:
+          registry-id: AWS_ACCOUNT_ID
+          region: ${AWS_DEFAULT_REGION}
+      - run:
+          name: "Setup CURRENT_TAG environment variables"
+          command: |
+            if [ -z "$CIRCLE_BRANCH" ];
+            then
+              CURRENT_TAG=$CIRCLE_TAG
+            else
+              CURRENT_TAG=$CIRCLE_BRANCH
+            fi
+            echo CURRENT_TAG=$CURRENT_TAG
+            echo "export CURRENT_TAG=\"${CURRENT_TAG}\"" >> "$BASH_ENV"
+      - run:
+          name: Check images in ecr
+          command: |
+            if [ "$CURRENT_TAG" == "main" ] ; then
+              IMAGE_TAG="dev-${CIRCLE_SHA1}"
+            else
+              IMAGE_TAG="${CURRENT_TAG}"
+            fi
+
+            echo "Checking image with IMAGE_TAG=$IMAGE_TAG for CURRENT_TAG=${CURRENT_TAG} in our ECR"
+            CURRENT_IMAGE=$(aws ecr describe-images --repository-name inbucket-ecr --image-ids=imageTag=${IMAGE_TAG}) || true
+
+            if [ "$CURRENT_IMAGE" != "" ] ; then
+              echo "We already have a ${IMAGE_TAG} image in our ERC"
+              echo "Skipping the Pull/Build/Push steps... "
+              echo $CURRENT_IMAGE
+              circleci-agent step halt
+            fi
+      - run:
+          name: Pulling latest docker image
+          command: |
+            docker pull $AWS_ECR_ACCOUNT_URL/inbucket-ecr:${CURRENT_TAG} || true
+            docker pull $AWS_ECR_ACCOUNT_URL/inbucket-ecr:dev-${CIRCLE_SHA1} || true
+      - run:
+          name: Building application Docker image
+          command: |
+            docker build \
+              --file Dockerfile \
+              --tag "$AWS_ECR_ACCOUNT_URL/inbucket-ecr:${CURRENT_TAG}" \
+              --tag "$AWS_ECR_ACCOUNT_URL/inbucket-ecr:dev-${CIRCLE_SHA1}" \
+              .
+      - when:
+          condition:
+            or:
+              - equal: [main, << pipeline.git.branch >>]
+              - << pipeline.git.tag >>
+          steps:
+            - run:
+                name: Pushing Docker image to AWS ECR
+                command: |
+                  docker image push --all-tags $AWS_ECR_ACCOUNT_URL/inbucket-ecr
+  deploy_job:
+    docker:
+      - image: cimg/base:stable
+    working_directory: ~/gitops
+    steps:
+      - run:
+          name: Cloning Gitops Repository
+          command: |
+            git clone https://$DEPLOY_GITHUB_TOKEN@github.com/clickfunnels2/cf2-gitops.git ~/gitops
+      - run:
+          name: Installing dependencies
+          command: |
+            sudo wget -qO /usr/local/bin/yq https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64
+            sudo chmod a+x /usr/local/bin/yq
+            echo 'yp --version' && yq --version
+      - run:
+          name: Update Docker image tag
+          command: |
+            VALUES_FOLDER="dev/inbucket"
+            ./scripts/update-image-tag.sh dev-$CIRCLE_SHA1 $VALUES_FOLDER $CIRCLE_SHA1
+      - run:
+          name: Commit changes to cf2-gitops repository
+          command: |
+            ./scripts/commit-img-tag.sh main "[Admin]"
+      - when:
+          condition: << pipeline.git.tag >>
+          steps:
+            - run:
+                name: Update { Dev | Release } Docker image tag
+                command: |
+                  ./scripts/update-image-tag.sh $CIRCLE_TAG "dev/inbucket" $CIRCLE_SHA1
+                  ./scripts/update-image-tag.sh $CIRCLE_TAG "release/inbucket" $CIRCLE_SHA1
+            - run:
+                name: Commit { Dev | Release } changes to cf2-gitops repository
+                command: |
+                  COMMIT_MESSAGE="Deploy Inbucket App tag ${CIRCLE_TAG}"
+                  ./scripts/commit-img-tag.sh main "[Inbucket]" "${COMMIT_MESSAGE}"
+            - run:
+                name: "Setup FROM_BRANCH environment variable"
+                command: echo 'export FROM_BRANCH="inbucket-tag-${CIRCLE_TAG}"' >> "$BASH_ENV"
+            - run:
+                name: Update Production Docker image tag
+                command: |
+                  git checkout -b $FROM_BRANCH
+                  ./scripts/update-image-tag.sh $CIRCLE_TAG production/inbucket $CIRCLE_SHA1
+                  git status
+            - run:
+                name: Commit Production changes to cf2-gitops repository
+                command: |
+                  ./scripts/commit-img-tag.sh "$FROM_BRANCH" "[Inbucket]"
+            - gh-cli/setup:
+                token: DEPLOY_GITHUB_TOKEN
+            - run:
+                name: Open Pull Request to Deploy to PRODUCTION
+                command: |
+                  PR_NAME="Deploy Inbucket App tag ${CIRCLE_TAG} to Production"
+                  DESCRIPTION="${PR_NAME}\n\n"
+                  DESCRIPTION="${DESCRIPTION}SHA1: ${CIRCLE_SHA1}\n"
+                  DESCRIPTION="${DESCRIPTION}Job build: ${CIRCLE_BUILD_URL}\n"
+                  echo PR_NAME=$PR_NAME
+                  echo FROM_BRANCH=$FROM_BRANCH
+                  CURRENT_PR=$(gh pr list --head ${FROM_BRANCH})
+                  if [ "$CURRENT_PR" == "" ] ; then
+                    gh pr create \
+                      --title "${PR_NAME}" \
+                      --body "$(echo -e $DESCRIPTION)" \
+                      --base main \
+                      --head $FROM_BRANCH
+                  else
+                    DESCRIPTION="${DESCRIPTION}\n\nUpdated in: $(date)\n"
+                    gh pr edit $FROM_BRANCH \
+                      --title "${PR_NAME}" \
+                      --body "$(echo -e $DESCRIPTION)"
+                  fi
+
+workflows:
+  build_and_deploy:
+    jobs:
+      - docker_build_and_push_app_image:
+          context: aws_ecr_context
+          filters:
+            branches:
+              only:
+                - main
+            tags:
+              only:
+                - /^v.*/
+      - deploy_job:
+          context: github_integration
+          requires:
+            - docker_build_and_push_app_image
+          filters:
+            branches:
+              only:
+                - main
+            tags:
+              only:
+                - /^v.*/
